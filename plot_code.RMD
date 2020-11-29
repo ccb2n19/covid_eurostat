@@ -1,0 +1,255 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Setup:
+
+```{r setup}
+library(tidyverse)
+library(sf)
+library(tmap)
+library(ggflags)
+library(emo)
+library(geofacet)
+path <- "C:/Users/brown/Desktop/europe_rail_stats"
+```
+
+Get data (Passengers transported (detailed reporting only) - (quarterly data) at https://ec.europa.eu/eurostat/web/transport/data/database)
+
+```{r}
+# Rail data
+stats_orig <- read_tsv(paste(path, "rail_pa_quartal.tsv", sep = "/"),
+                       na = c(":", ": c"))
+
+# Country codes
+url <- "https://gist.githubusercontent.com/sjockers/658708ffd06d81c4500cc938197da3ff/raw/86e4268408834c1c8e3311f6b7a0d3b2d8ec6612/eu_country_codes.csv"
+
+names <- read_csv(url,
+                  col_names = FALSE) %>%
+  select("country_code" = 1,
+         "country_name" = 2)
+
+# Population
+population <- read_tsv(paste(path, "tps00001.tsv", sep = "/"),
+                       na = c(":", ": c")) %>%
+  rename(code = 1) %>%
+  mutate_if(is.numeric, as.character) %>%
+  pivot_longer(cols = 2:ncol(.),
+               names_to = "year",
+               values_to = "value") %>%
+  mutate(new_value = str_remove(value, "[:space:][:alpha:]"),
+         new_value = str_remove(new_value, "p$"),
+         new_value = as.numeric(new_value),
+         country_code = str_extract(code, "(?<=\\,)[:alpha:][:alpha:]"),
+         year = as.numeric(year),
+         id = paste(country_code, year, sep = "_")) %>%
+  select(id, country_code, year, new_value)
+
+
+stats <- stats_orig %>%
+  separate(1,
+           into = c("unit", "stat", "country_code", "time"),
+           sep  = "_|,") %>%
+  pivot_longer(cols      = 5:ncol(.),
+               names_to  = "period",
+               values_to = "value") %>%
+  select(-unit) %>%
+  mutate(year    = str_extract(period, "[:digit:][:digit:][:digit:][:digit:]"),
+         year    = as.numeric(year),
+         quarter = str_extract(period, "(?<=Q)[:digit:]"),
+         quarter = as.numeric(quarter),
+         id = paste(country_code, year, quarter, sep = "_")) %>%
+  filter(!str_detect(id, "EU27|EU28")) %>%
+  pivot_wider(names_from  = stat,
+              values_from = value,
+              id_cols     = c(id, country_code, year, quarter)) %>%
+  left_join(names, 
+            by = "country_code") %>%
+  left_join(population %>% 
+              select(country_code, year, population = new_value), 
+            by = c("country_code", "year")) %>%
+  filter(!is.na(PKM) | !is.na(PAS)) %>%
+  mutate(yr_qtr = year + ((quarter - 1) / 4)) %>%
+  select(id, country_code, country_name, year, quarter, yr_qtr, everything()) %>%
+  mutate(km_per_capita    = (PKM * 1000000) / population,
+         trips_per_capita = (PAS * 1000) / population)
+```
+
+Prepare data for the plot:
+
+- Emojis DONE
+- % difference between Q2 2019 and Q2 2020
+
+```{r}
+library(rvest)
+
+
+# Get countries with recent COVID data
+covid_data <- stats %>% filter(yr_qtr == 2020.25) %>% pull(country_code)
+
+# Get the emojis
+plot_data <- stats %>%
+  filter(country_code %in% covid_data) %>%
+  mutate(country_code = str_to_lower(country_code),
+         country_name_ji = case_when(country_name == "North Macedonia" ~ "Macedonia",
+                                     country_name == "United Kingdom" ~ "uk",
+                                                               TRUE ~  country_name),
+         emoji = sapply(country_name_ji, emo::ji))
+
+emoji_to_link <- function(x) {
+  paste0("https://emojipedia.org/emoji/",x) %>%
+    read_html() %>%
+    html_nodes("tr td a") %>%
+    .[1] %>%
+    html_attr("href") %>%
+    paste0("https://emojipedia.org/", .) %>%
+    read_html() %>%
+    html_node('div[class="vendor-image"] img') %>%
+    html_attr("src")
+}
+
+link_to_img <- function(x, size = 15) {
+  paste0("<img src='", x, "' width='", size, "'/>")
+}
+
+just_emojis <- plot_data %>%
+  distinct(emoji) %>%
+  mutate(url = map_chr(emoji, slowly(~emoji_to_link(.x), rate_delay(1))),
+         label = link_to_img(url))
+
+plot_data <- plot_data %>%
+  left_join(just_emojis, by = "emoji") %>%
+  mutate(rmd_label = paste0(label, " ", country_name))
+
+# Get the Q2 2019 value
+q2_2019 <- plot_data %>%
+  filter(yr_qtr == 2019.25) %>%
+  select(country_code, q2_2019_km_per_capita = km_per_capita)
+
+q2_2019 <- plot_data %>%
+  left_join(q2_2019, by = "country_code") %>%
+  filter(yr_qtr == 2020.25) %>%
+  mutate(drop = (km_per_capita - q2_2019_km_per_capita) / q2_2019_km_per_capita) %>%
+  select(country_code, rmd_label, drop) %>%
+  arrange(drop) %>%
+  mutate(rmd_label = fct_inorder(rmd_label),
+         label = round(drop * 100, 0),
+         label = paste0(label, "%"))
+
+plot_data_final <- plot_data %>%
+  select(-rmd_label) %>%
+  left_join(q2_2019 %>% select(country_code, rmd_label), by = "country_code")
+```
+
+
+Plot ...
+
+```{r fig.width = 15, fig.height = 20}
+library(ggtext)
+
+paste(" \nCreated by Christopher C Brown using ggplot2() and ggtext() packages in R. Code at github.com/ccb2n19.",
+      "Data from Eurostat tables 'Passengers transported - quarterly data' and 'Population on 1 January (tps00001)'. Emojis from emojipedia.org.",
+      sep = "\n") -> refs
+
+"Rail kilometres per capita in Europe since 2010 (and the Covid dip)" -> title
+"From 2010 to quarter two (Q2) 2020. Label shows change between Q1 2019 and Q2 2020. Countries only shown where data available for Q2 2020." -> subtitle
+
+ggplot(data = plot_data_final, aes(x = yr_qtr, y = km_per_capita)) +
+  geom_line(col = "grey29", #"orangered4"
+            lwd = 1.3) +
+  geom_vline(xintercept = 2019.25,
+             lty = "dashed",
+             colour = "grey70") +
+  geom_vline(xintercept = 2020.25,
+             lty = "dashed",
+             colour = "grey70") +
+  geom_label(data = q2_2019,
+            aes(x = 2019.75,
+                y = 700,
+                label  = label),
+            label.size = 1,
+            label.padding = unit(0.25, "lines"),
+            colour = "grey29",
+            fill = "white",
+            size = 5) +
+  facet_wrap(~rmd_label,
+             ncol = 4) +
+  scale_x_continuous(breaks = seq(2010, 2020, by = 3),
+                     limits = c(2010, 2020.25)) +
+  scale_y_continuous(limits = c(0, 750)) +
+  labs(title    = title,
+       subtitle = subtitle,
+       x        = "",
+       y        = "Per capita passenger km by rail during quarter",
+       caption  = refs) +
+  theme_light() +
+  theme(strip.text       = element_markdown(size   = 14,
+                                            colour = "grey29",
+                                            vjust  = 0.5,
+                                            hjust  = 0),
+        strip.background = element_rect(fill       = "grey99"),
+        axis.text        = element_text(colour     = "grey29",
+                                        size       = 14),
+        axis.title       = element_text(colour     = "grey29",
+                                        size       = 14),
+        plot.background  = element_rect(fill       = "grey99"),
+        panel.background = element_rect(fill       = "grey99"),
+        plot.title       = element_text(colour     = "grey29",
+                                        size       = 24,
+                                        hjust      = 0),
+        plot.subtitle    = element_text(colour     = "grey29",
+                                        size       = 14,
+                                        hjust      = 0),
+        plot.caption     = element_text(size   = 14,
+                                        hjust  = 0,
+                                        colour = "grey29",
+                                        margin = c())) -> plot
+
+ggsave("plot_1.png",
+       plot,
+       width  = 15, #15
+       height = 20) #20
+```
+
+```{r fig.width = 15, fig.height = 20}
+d=data.frame(c=colors(), y=seq(0, length(colors())-1)%%66, x=seq(0, length(colors())-1)%/%66)
+ggplot() +
+scale_x_continuous(name="", breaks=NULL, expand=c(0, 0)) +
+scale_y_continuous(name="", breaks=NULL, expand=c(0, 0)) +
+scale_fill_identity() +
+geom_rect(data=d, mapping=aes(xmin=x, xmax=x+1, ymin=y, ymax=y+1), fill="white") +
+geom_rect(data=d, mapping=aes(xmin=x+0.05, xmax=x+0.95, ymin=y+0.5, ymax=y+1, fill=c)) +
+geom_text(data=d, mapping=aes(x=x+0.5, y=y+0.5, label=c), colour="black", hjust=0.5, vjust=1, size=3)
+```
+
+```{r}
+library(grid)
+library(gridtext)
+
+text <- c(
+  "Some text **in bold.**", "Linebreaks<br>Linebreaks<br>Linebreaks",
+  "*x*<sup>2</sup> + 5*x* + *C*<sub>*i*</sub>",
+  "Some <span style='color:blue'>blue text **in bold.**</span><br>And *italics text.*<br>
+   And some <span style='font-size:18pt; color:black'>large</span> text."
+)
+
+x <- c(.2, .1, .7, .9)
+y <- c(.8, .4, .1, .5)
+rot <- c(0, 0, 45, -45)
+gp = gpar(col = c("black", "red"), fontfamily = c("Palatino", "Courier", "Times", "Helvetica"))
+box_gp = gpar(col = "black", fill = c("cornsilk", NA, "lightblue1", NA), lty = c(0, 1, 1, 1))
+hjust <- c(0.5, 0, 0, 1)
+vjust <- c(0.5, 1, 0, 0.5)
+
+g <- richtext_grob(
+  text, x, y, hjust = hjust, vjust = vjust, rot = rot,
+  padding = unit(c(6, 6, 4, 6), "pt"),
+  r = unit(c(0, 2, 4, 8), "pt"),
+  gp = gp, box_gp = box_gp
+)
+grid.newpage()
+grid.draw(g)
+grid.points(x, y, default.units = "npc", pch = 19, size = unit(5, "pt"))
+```
+
